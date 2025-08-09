@@ -1,337 +1,583 @@
 #!/usr/bin/env python3
-import argparse
-import sys
-from pathlib import Path
+"""
+Daily Porpoise Detection Analysis and Visualization
+Analyze and visualize one day of porpoise detection results
+ENHANCED VERSION - includes signal dB range and additional statistics
+"""
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import soundfile as sf
-from matplotlib.gridspec import GridSpec
+from pathlib import Path
+import argparse
+from datetime import datetime, timedelta
+import glob
 
 
-class ComparisonVisualizer:
-    def __init__(self, detection_path: Path):
-        """載入檢測比較結果"""
-        try:
-            if detection_path.is_file():
-                # 單一CSV檔案
-                self.df = pd.read_csv(detection_path)
-                self.source_type = "single_file"
-            elif detection_path.is_dir():
-                # 目錄中的多個比較CSV檔案
-                csv_files = list(detection_path.glob("*_comparison.csv"))
-                if not csv_files:
-                    raise ValueError(f"目錄中未找到 *_comparison.csv 檔案")
+class DailyAnalyzer:
+    def __init__(self):
+        self.detection_files = []
+        self.stats_files = []
+        self.detections_df = None
+        self.stats_df = None
 
-                dfs = []
-                for csv_file in csv_files:
-                    df_temp = pd.read_csv(csv_file)
-                    if not df_temp.empty:
-                        dfs.append(df_temp)
+    def load_data(self, results_dir):
+        """Load detection and stats data from results directory"""
+        results_path = Path(results_dir)
 
-                if not dfs:
-                    raise ValueError("所有CSV檔案都是空的")
+        # Load detection files
+        detection_dir = results_path / "detections"
+        stats_dir = results_path / "stats"
 
-                self.df = pd.concat(dfs, ignore_index=True)
-                self.source_type = "directory"
-                print(f"載入 {len(csv_files)} 個比較檔案")
+        if not detection_dir.exists() or not stats_dir.exists():
+            raise ValueError(f"Results directory must contain 'detections' and 'stats' subdirectories")
+
+        # Find all CSV files
+        detection_files = sorted(detection_dir.glob("*.csv"))
+        stats_files = sorted(stats_dir.glob("*.csv"))
+
+        print(f"Found {len(detection_files)} detection files")
+        print(f"Found {len(stats_files)} stats files")
+
+        # Load and combine detection data
+        all_detections = []
+        for file_path in detection_files:
+            try:
+                df = pd.read_csv(file_path)
+                if not df.empty and df['group_id'].iloc[0] != 0:  # Skip empty detection files
+                    df['source_file'] = file_path.stem
+                    all_detections.append(df)
+            except Exception as e:
+                print(f"Error reading {file_path}: {e}")
+
+        # Load and combine stats data
+        all_stats = []
+        for file_path in stats_files:
+            try:
+                df = pd.read_csv(file_path)
+                df['source_file'] = file_path.stem
+                all_stats.append(df)
+            except Exception as e:
+                print(f"Error reading {file_path}: {e}")
+
+        # Combine data
+        self.detections_df = pd.concat(all_detections, ignore_index=True) if all_detections else pd.DataFrame()
+        self.stats_df = pd.concat(all_stats, ignore_index=True) if all_stats else pd.DataFrame()
+
+        # Add dB calculations
+        self._calculate_db_values()
+
+        # Extract time information from filenames
+        self._extract_time_info()
+
+        # Debug info
+        print(f"Loaded detections: {len(self.detections_df)} rows")
+        print(f"Loaded stats: {len(self.stats_df)} rows")
+
+    def _calculate_db_values(self):
+        """Calculate dB values from signal levels"""
+        if not self.stats_df.empty:
+            # Calculate dB values, handling zero/negative values
+            self.stats_df['signal_max_db'] = np.where(
+                self.stats_df['signal_max'] > 0,
+                20 * np.log10(self.stats_df['signal_max']),
+                -np.inf
+            )
+            self.stats_df['signal_min_db'] = np.where(
+                self.stats_df['signal_min'] > 0,
+                20 * np.log10(self.stats_df['signal_min']),
+                -np.inf
+            )
+            self.stats_df['signal_mean_db'] = np.where(
+                self.stats_df['signal_mean'] > 0,
+                20 * np.log10(self.stats_df['signal_mean']),
+                -np.inf
+            )
+            self.stats_df['background_level_db'] = np.where(
+                self.stats_df['background_level'] > 0,
+                20 * np.log10(self.stats_df['background_level']),
+                -np.inf
+            )
+
+            # Calculate dynamic range for each file
+            self.stats_df['dynamic_range_db'] = self.stats_df['signal_max_db'] - self.stats_df['signal_min_db']
+
+    def _extract_time_info(self):
+        """Extract time information from filenames"""
+        if not self.stats_df.empty:
+            # Try to extract time from filename - this is dataset specific
+            # You may need to adjust this based on your filename format
+            self.stats_df['file_hour'] = range(len(self.stats_df))  # Placeholder - use file order as time
+
+        if not self.detections_df.empty:
+            # Add time info to detections
+            file_to_hour = dict(zip(self.stats_df['source_file'], self.stats_df['file_hour']))
+            self.detections_df['file_hour'] = self.detections_df['source_file'].map(file_to_hour)
+
+    def generate_daily_summary(self):
+        """Generate daily summary statistics - ENHANCED VERSION"""
+        if self.stats_df.empty:
+            return "No data to analyze"
+
+        total_files = len(self.stats_df)
+        files_with_detections = len(self.detections_df['source_file'].unique()) if not self.detections_df.empty else 0
+        total_groups = len(self.detections_df) if not self.detections_df.empty else 0
+        total_clicks = self.detections_df['num_clicks'].sum() if not self.detections_df.empty else 0
+
+        # Signal quality stats - safe calculations
+        avg_background = self.stats_df['background_level'].mean() if 'background_level' in self.stats_df.columns else 0
+        avg_snr = self.stats_df['snr_mean'].mean() if 'snr_mean' in self.stats_df.columns and not self.stats_df[
+            'snr_mean'].isna().all() else 0
+        detection_rate = (files_with_detections / total_files * 100) if total_files > 0 else 0
+
+        # Safe division for average clicks per group
+        avg_clicks_per_group = total_clicks / total_groups if total_groups > 0 else 0
+
+        # Enhanced signal statistics
+        signal_stats = ""
+        if 'signal_max_db' in self.stats_df.columns:
+            valid_max_db = self.stats_df['signal_max_db'][self.stats_df['signal_max_db'] != -np.inf]
+            valid_min_db = self.stats_df['signal_min_db'][self.stats_df['signal_min_db'] != -np.inf]
+            valid_mean_db = self.stats_df['signal_mean_db'][self.stats_df['signal_mean_db'] != -np.inf]
+            valid_bg_db = self.stats_df['background_level_db'][self.stats_df['background_level_db'] != -np.inf]
+            valid_dynamic_range = self.stats_df['dynamic_range_db'][np.isfinite(self.stats_df['dynamic_range_db'])]
+
+            if len(valid_max_db) > 0:
+                signal_stats = f"""
+Signal Level Statistics (dB):
+• Maximum Signal: {valid_max_db.max():.1f} dB
+• Minimum Signal: {valid_min_db.min():.1f} dB
+• Average Maximum: {valid_max_db.mean():.1f} dB
+• Average Minimum: {valid_min_db.mean():.1f} dB
+• Average Mean Signal: {valid_mean_db.mean():.1f} dB
+• Average Background: {valid_bg_db.mean():.1f} dB
+• Average Dynamic Range: {valid_dynamic_range.mean():.1f} dB"""
+
+        # Frequency analysis for detections
+        frequency_stats = ""
+        if not self.detections_df.empty and 'mean_frequency_hz' in self.detections_df.columns:
+            valid_freq = self.detections_df['mean_frequency_hz'][self.detections_df['mean_frequency_hz'] > 0]
+            if len(valid_freq) > 0:
+                frequency_stats = f"""
+Frequency Analysis:
+• Mean Frequency: {valid_freq.mean() / 1000:.1f} kHz
+• Frequency Range: {valid_freq.min() / 1000:.1f} - {valid_freq.max() / 1000:.1f} kHz
+• Frequency Std: {valid_freq.std() / 1000:.1f} kHz"""
+
+        summary = f"""
+=== Daily Porpoise Detection Summary ===
+Analysis Period: {total_files} files (approximately {total_files * 0.5:.1f} hours)
+
+Detection Results:
+• Total Groups Detected: {total_groups}
+• Total Clicks: {total_clicks}
+• Files with Detections: {files_with_detections}/{total_files} ({detection_rate:.1f}%)
+• Average Clicks per Group: {avg_clicks_per_group:.1f}
+
+Signal Quality:
+• Average Background Level: {avg_background:.6f}
+• Average SNR: {avg_snr:.1f} dB
+• Detection Rate: {detection_rate:.1f}%{signal_stats}{frequency_stats}
+
+Peak Activity:
+"""
+
+        if not self.detections_df.empty and 'file_hour' in self.detections_df.columns:
+            hourly_counts = self.detections_df.groupby('file_hour').size()
+            if not hourly_counts.empty:
+                peak_hour = hourly_counts.idxmax()
+                peak_count = hourly_counts.max()
+                summary += f"• Peak Activity: File #{peak_hour} ({peak_count} groups)\n"
             else:
-                raise ValueError(f"路徑不存在: {detection_path}")
+                summary += "• No peak activity data available\n"
+        else:
+            summary += "• No activity detected\n"
 
-            self.files = self.df['filename'].unique() if not self.df.empty else []
-            self.thresholds = sorted(self.df['threshold_factor'].unique()) if not self.df.empty else []
-            print(f"載入檢測結果: {len(self.df)} clicks, {len(self.files)} 檔案, {len(self.thresholds)} 個閾值")
+        return summary
 
-        except Exception as e:
-            print(f"無法載入檢測結果: {e}")
-            sys.exit(1)
+    def create_visualizations(self, output_dir):
+        """Create comprehensive visualization plots - ENHANCED VERSION"""
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
 
-    def plot_threshold_comparison(self, output_path: Path = None):
-        """繪製閾值比較圖"""
-        fig = plt.figure(figsize=(16, 12))
-        gs = GridSpec(3, 2, figure=fig, hspace=0.3, wspace=0.3)
+        # Set style
+        plt.style.use('default')
+        sns.set_palette("husl")
 
-        # 1. 各閾值檢測數量比較
-        ax1 = fig.add_subplot(gs[0, :])
-        threshold_counts = self.df.groupby('threshold_factor').size()
+        # Create figure with subplots
+        fig = plt.figure(figsize=(24, 16))
 
-        bars = ax1.bar(threshold_counts.index, threshold_counts.values,
-                       alpha=0.7, color='skyblue', edgecolor='black')
-        ax1.set_xlabel('檢測閾值倍數')
-        ax1.set_ylabel('檢測到的Click數量')
-        ax1.set_title('不同閾值的檢測效果比較', fontsize=14, fontweight='bold')
-        ax1.grid(True, alpha=0.3)
+        # 1. Timeline of detections (top plot)
+        ax1 = plt.subplot(3, 4, (1, 4))  # Span across top
+        self._plot_detection_timeline(ax1)
 
-        # 添加數值標籤
-        for bar, count in zip(bars, threshold_counts.values):
-            ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + count * 0.01,
-                     str(count), ha='center', va='bottom', fontweight='bold')
+        # 2. Signal dB distribution
+        ax2 = plt.subplot(3, 4, 5)
+        self._plot_signal_db_distribution(ax2)
 
-        # 2. 持續時間分布比較
-        ax2 = fig.add_subplot(gs[1, 0])
-        colors = plt.cm.Set1(np.linspace(0, 1, len(self.thresholds)))
+        # 3. Signal quality distribution
+        ax3 = plt.subplot(3, 4, 6)
+        self._plot_signal_quality(ax3)
 
-        for i, threshold in enumerate(self.thresholds):
-            threshold_data = self.df[self.df['threshold_factor'] == threshold]
-            if not threshold_data.empty:
-                ax2.hist(threshold_data['duration_us'], bins=30, alpha=0.6,
-                         label=f'閾值 {threshold}', color=colors[i], density=True)
+        # 4. Detection statistics
+        ax4 = plt.subplot(3, 4, 7)
+        self._plot_detection_stats(ax4)
 
-        ax2.axvline(111.6, color='red', linestyle='--', linewidth=2, label='期望值: 111.6μs')
-        ax2.set_xlabel('持續時間 (μs)')
-        ax2.set_ylabel('密度')
-        ax2.set_title('各閾值持續時間分布')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
+        # 5. Hourly activity heatmap
+        ax5 = plt.subplot(3, 4, 8)
+        self._plot_activity_heatmap(ax5)
 
-        # 3. 幅度分布比較
-        ax3 = fig.add_subplot(gs[1, 1])
+        # 6. Signal vs Background comparison
+        ax6 = plt.subplot(3, 4, 9)
+        self._plot_signal_vs_background(ax6)
 
-        for i, threshold in enumerate(self.thresholds):
-            threshold_data = self.df[self.df['threshold_factor'] == threshold]
-            if not threshold_data.empty:
-                ax3.hist(threshold_data['max_amplitude'], bins=30, alpha=0.6,
-                         label=f'閾值 {threshold}', color=colors[i], density=True)
+        # 7. Dynamic range analysis
+        ax7 = plt.subplot(3, 4, 10)
+        self._plot_dynamic_range(ax7)
 
-        ax3.set_xlabel('最大幅度')
-        ax3.set_ylabel('密度')
-        ax3.set_title('各閾值幅度分布')
-        ax3.legend()
-        ax3.grid(True, alpha=0.3)
+        # 8. Frequency distribution (if available)
+        ax8 = plt.subplot(3, 4, 11)
+        self._plot_frequency_distribution(ax8)
 
-        # 4. 檔案檢測統計
-        ax4 = fig.add_subplot(gs[2, 0])
+        # 9. Detection quality scatter
+        ax9 = plt.subplot(3, 4, 12)
+        self._plot_detection_quality_scatter(ax9)
 
-        # 計算每個檔案在不同閾值下的檢測數量
-        file_threshold_counts = self.df.groupby(['filename', 'threshold_factor']).size().unstack(fill_value=0)
+        plt.tight_layout()
 
-        if len(self.files) <= 20:  # 如果檔案不多，顯示所有檔案
-            file_threshold_counts.plot(kind='bar', ax=ax4, color=colors[:len(self.thresholds)])
-            ax4.set_xticklabels(ax4.get_xticklabels(), rotation=45, ha='right')
-        else:  # 如果檔案太多，顯示統計
-            ax4.text(0.5, 0.5, f'檔案數量過多 ({len(self.files)} 個)\n參見右側統計',
-                     ha='center', va='center', transform=ax4.transAxes, fontsize=12)
-
-        ax4.set_xlabel('檔案')
-        ax4.set_ylabel('Click數量')
-        ax4.set_title('各檔案檢測結果')
-        ax4.legend(title='閾值', bbox_to_anchor=(1.05, 1), loc='upper left')
-        ax4.grid(True, alpha=0.3)
-
-        # 5. 統計摘要
-        ax5 = fig.add_subplot(gs[2, 1])
-        ax5.axis('off')
-
-        # 計算統計資訊
-        stats_text = f"""閾值比較統計摘要
-總檔案數: {len(self.files)}
-比較閾值: {self.thresholds}
-
-各閾值檢測結果:"""
-
-        for threshold in self.thresholds:
-            threshold_data = self.df[self.df['threshold_factor'] == threshold]
-            count = len(threshold_data)
-            if count > 0:
-                mean_duration = threshold_data['duration_us'].mean()
-                mean_amplitude = threshold_data['max_amplitude'].mean()
-                stats_text += f"""
-  閾值 {threshold}: {count} clicks
-    平均持續時間: {mean_duration:.1f}μs
-    平均幅度: {mean_amplitude:.4f}"""
-            else:
-                stats_text += f"""
-  閾值 {threshold}: 0 clicks"""
-
-        # 檢測率比較
-        if len(self.thresholds) > 1:
-            base_threshold = min(self.thresholds)
-            base_count = len(self.df[self.df['threshold_factor'] == base_threshold])
-            stats_text += f"""
-
-相對檢測率 (以閾值{base_threshold}為基準):"""
-            for threshold in self.thresholds:
-                threshold_count = len(self.df[self.df['threshold_factor'] == threshold])
-                if base_count > 0:
-                    ratio = threshold_count / base_count * 100
-                    stats_text += f"""
-  閾值 {threshold}: {ratio:.1f}%"""
-
-        ax5.text(0.05, 0.95, stats_text, transform=ax5.transAxes, fontsize=9,
-                 verticalalignment='top', fontfamily='monospace',
-                 bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
-
-        plt.suptitle('江豚Click檢測 - 閾值比較分析', fontsize=16, fontweight='bold')
-
-        if output_path:
-            plt.savefig(output_path, dpi=300, bbox_inches='tight')
-            print(f"比較圖已儲存: {output_path}")
-
+        # Save plot
+        plot_path = output_path / "enhanced_daily_analysis.png"
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.show()
 
-    def plot_file_detail(self, filename: str, audio_dir: Path = None, output_path: Path = None):
-        """繪製單檔案的閾值比較"""
-        file_data = self.df[self.df['filename'] == filename]
-        if file_data.empty:
-            print(f"檔案 {filename} 無檢測結果")
+        print(f"Enhanced visualization saved to: {plot_path}")
+
+        # Create additional detailed plots only if we have detection data
+        if not self.detections_df.empty:
+            self._create_detailed_plots(output_path)
+
+    def _plot_signal_db_distribution(self, ax):
+        """Plot signal dB level distribution"""
+        if self.stats_df.empty or 'signal_max_db' not in self.stats_df.columns:
+            ax.text(0.5, 0.5, 'No dB data', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('Signal dB Distribution')
             return
 
-        fig = plt.figure(figsize=(16, 10))
-        gs = GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.3)
+        # Get valid dB values
+        valid_max_db = self.stats_df['signal_max_db'][self.stats_df['signal_max_db'] != -np.inf]
+        valid_min_db = self.stats_df['signal_min_db'][self.stats_df['signal_min_db'] != -np.inf]
+        valid_mean_db = self.stats_df['signal_mean_db'][self.stats_df['signal_mean_db'] != -np.inf]
 
-        # 1. 時間軸click分布（不同閾值用不同顏色）
-        ax1 = fig.add_subplot(gs[0, :])
+        if len(valid_max_db) > 0:
+            ax.hist(valid_max_db, bins=30, alpha=0.7, label='Max dB', color='red')
+            ax.hist(valid_mean_db, bins=30, alpha=0.7, label='Mean dB', color='blue')
+            ax.hist(valid_min_db, bins=30, alpha=0.7, label='Min dB', color='green')
 
-        # 如果有音檔路徑，讀取並繪製envelope
-        if audio_dir:
-            audio_path = audio_dir / filename
-            if audio_path.exists():
-                try:
-                    iq_data_raw, fs = sf.read(audio_path, dtype=np.float32)
-                    iq_data = iq_data_raw[:, 0] + 1j * iq_data_raw[:, 1]
-                    envelope = np.abs(iq_data)
-
-                    # 降採樣顯示（如果太長）
-                    if len(envelope) > 500000:
-                        downsample_factor = len(envelope) // 200000
-                        envelope = envelope[::downsample_factor]
-                        fs = fs / downsample_factor
-
-                    t = np.arange(len(envelope)) / fs
-                    ax1.plot(t, envelope, 'b-', alpha=0.6, linewidth=0.5, label='Signal Envelope')
-                    ax1.set_yscale('log')
-
-                except Exception as e:
-                    print(f"無法載入音檔 {filename}: {e}")
-
-        # 標記不同閾值的clicks
-        colors = plt.cm.Set1(np.linspace(0, 1, len(self.thresholds)))
-        for i, threshold in enumerate(self.thresholds):
-            threshold_clicks = file_data[file_data['threshold_factor'] == threshold]
-            for _, click in threshold_clicks.iterrows():
-                ax1.axvspan(click['start_time'], click['end_time'],
-                            alpha=0.6, color=colors[i],
-                            label=f'閾值 {threshold}' if _ == threshold_clicks.index[0] else '')
-
-        ax1.set_xlabel('時間 (s)')
-        ax1.set_ylabel('幅度')
-        ax1.set_title(f'{filename} - 不同閾值檢測結果比較')
-        ax1.grid(True, alpha=0.3)
-        ax1.legend()
-
-        # 2. 檢測數量比較
-        ax2 = fig.add_subplot(gs[1, 0])
-        threshold_counts = file_data.groupby('threshold_factor').size()
-
-        bars = ax2.bar(threshold_counts.index, threshold_counts.values,
-                       color=colors[:len(threshold_counts)], alpha=0.7, edgecolor='black')
-        ax2.set_xlabel('閾值倍數')
-        ax2.set_ylabel('Click數量')
-        ax2.set_title('各閾值檢測數量')
-        ax2.grid(True, alpha=0.3)
-
-        # 添加數值標籤
-        for bar, count in zip(bars, threshold_counts.values):
-            ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + count * 0.05,
-                     str(count), ha='center', va='bottom')
-
-        # 3. 持續時間vs閾值
-        ax3 = fig.add_subplot(gs[1, 1])
-
-        threshold_durations = []
-        threshold_labels = []
-        for threshold in self.thresholds:
-            threshold_data = file_data[file_data['threshold_factor'] == threshold]
-            if not threshold_data.empty:
-                threshold_durations.append(threshold_data['duration_us'].values)
-                threshold_labels.append(f'{threshold}')
-
-        if threshold_durations:
-            ax3.boxplot(threshold_durations, labels=threshold_labels)
-            ax3.axhline(111.6, color='red', linestyle='--', alpha=0.7, label='期望值: 111.6μs')
-            ax3.set_xlabel('閾值倍數')
-            ax3.set_ylabel('持續時間 (μs)')
-            ax3.set_title('持續時間分布比較')
-            ax3.legend()
-            ax3.grid(True, alpha=0.3)
+            ax.set_xlabel('Signal Level (dB)')
+            ax.set_ylabel('Frequency')
+            ax.set_title('Signal dB Distribution')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
         else:
-            ax3.text(0.5, 0.5, '無檢測結果', ha='center', va='center',
-                     transform=ax3.transAxes, fontsize=12)
-            ax3.set_title('持續時間分布比較')
+            ax.text(0.5, 0.5, 'No valid dB data', ha='center', va='center', transform=ax.transAxes)
 
-        if output_path:
-            plt.savefig(output_path, dpi=300, bbox_inches='tight')
-            print(f"檔案分析圖已儲存: {output_path}")
+    def _plot_signal_vs_background(self, ax):
+        """Plot signal vs background levels"""
+        if self.stats_df.empty or 'signal_mean_db' not in self.stats_df.columns:
+            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('Signal vs Background')
+            return
 
-        plt.show()
+        valid_signal = self.stats_df['signal_mean_db'][self.stats_df['signal_mean_db'] != -np.inf]
+        valid_bg = self.stats_df['background_level_db'][self.stats_df['background_level_db'] != -np.inf]
 
-    def export_comparison_summary(self, output_path: Path):
-        """匯出比較摘要"""
-        # 計算各閾值統計
-        summary_data = []
+        if len(valid_signal) > 0 and len(valid_bg) > 0:
+            ax.scatter(valid_bg, valid_signal, alpha=0.6)
+            ax.set_xlabel('Background Level (dB)')
+            ax.set_ylabel('Mean Signal Level (dB)')
+            ax.set_title('Signal vs Background Comparison')
 
-        for threshold in self.thresholds:
-            threshold_data = self.df[self.df['threshold_factor'] == threshold]
+            # Add diagonal line
+            min_val = min(valid_bg.min(), valid_signal.min())
+            max_val = max(valid_bg.max(), valid_signal.max())
+            ax.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.5, label='Equal line')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
 
-            summary_data.append({
-                'threshold_factor': threshold,
-                'total_clicks': len(threshold_data),
-                'files_with_clicks': threshold_data['filename'].nunique(),
-                'mean_duration_us': threshold_data['duration_us'].mean() if not threshold_data.empty else 0,
-                'std_duration_us': threshold_data['duration_us'].std() if not threshold_data.empty else 0,
-                'mean_amplitude': threshold_data['max_amplitude'].mean() if not threshold_data.empty else 0,
-                'std_amplitude': threshold_data['max_amplitude'].std() if not threshold_data.empty else 0
-            })
+    def _plot_dynamic_range(self, ax):
+        """Plot dynamic range analysis"""
+        if self.stats_df.empty or 'dynamic_range_db' not in self.stats_df.columns:
+            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('Dynamic Range')
+            return
 
-        summary_df = pd.DataFrame(summary_data)
-        summary_df.to_csv(output_path, index=False)
-        print(f"比較摘要已匯出: {output_path}")
+        valid_range = self.stats_df['dynamic_range_db'][np.isfinite(self.stats_df['dynamic_range_db'])]
+
+        if len(valid_range) > 0:
+            ax.hist(valid_range, bins=20, alpha=0.7, color='purple')
+            ax.set_xlabel('Dynamic Range (dB)')
+            ax.set_ylabel('Frequency')
+            ax.set_title(f'Dynamic Range Distribution\nMean: {valid_range.mean():.1f} dB')
+            ax.grid(True, alpha=0.3)
+
+    def _plot_frequency_distribution(self, ax):
+        """Plot frequency distribution for detections"""
+        if self.detections_df.empty or 'mean_frequency_hz' not in self.detections_df.columns:
+            ax.text(0.5, 0.5, 'No frequency data', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('Frequency Distribution')
+            return
+
+        valid_freq = self.detections_df['mean_frequency_hz'][
+                         self.detections_df['mean_frequency_hz'] > 0] / 1000  # Convert to kHz
+
+        if len(valid_freq) > 0:
+            ax.hist(valid_freq, bins=20, alpha=0.7, color='orange')
+            ax.set_xlabel('Frequency (kHz)')
+            ax.set_ylabel('Number of Groups')
+            ax.set_title(f'Detection Frequency Distribution\nMean: {valid_freq.mean():.1f} kHz')
+            ax.grid(True, alpha=0.3)
+
+    def _plot_detection_quality_scatter(self, ax):
+        """Plot detection quality scatter plot"""
+        if self.detections_df.empty:
+            ax.text(0.5, 0.5, 'No detections', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('Detection Quality')
+            return
+
+        if 'mean_snr_db' in self.detections_df.columns and 'num_clicks' in self.detections_df.columns:
+            scatter = ax.scatter(self.detections_df['mean_snr_db'],
+                                 self.detections_df['num_clicks'],
+                                 alpha=0.6, c=self.detections_df['duration_ms'],
+                                 cmap='viridis')
+            ax.set_xlabel('Mean SNR (dB)')
+            ax.set_ylabel('Number of Clicks')
+            ax.set_title('Detection Quality: SNR vs Click Count')
+            plt.colorbar(scatter, ax=ax, label='Duration (ms)')
+            ax.grid(True, alpha=0.3)
+
+    def _plot_detection_timeline(self, ax):
+        """Plot detection timeline across the day - ENHANCED VERSION"""
+        if self.stats_df.empty:
+            ax.text(0.5, 0.5, 'No data available', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('Detection Timeline')
+            return
+
+        # Create hourly detection counts
+        if not self.detections_df.empty and 'file_hour' in self.detections_df.columns:
+            hourly_groups = self.detections_df.groupby('file_hour').size()
+            hours = hourly_groups.index
+            counts = hourly_groups.values
+
+            # Bar plot for detections
+            bars = ax.bar(hours, counts, alpha=0.7, color='lightblue', label='Groups Detected')
+
+            # Add trend line only if we have enough data points
+            if len(hours) > 1:
+                try:
+                    z = np.polyfit(hours, counts, 1)
+                    p = np.poly1d(z)
+                    ax.plot(hours, p(hours), "r--", alpha=0.8, label='Trend')
+                except:
+                    pass
+
+        # Plot background noise level as secondary y-axis
+        ax2 = ax.twinx()
+        if 'background_level_db' in self.stats_df.columns and 'file_hour' in self.stats_df.columns:
+            valid_bg_db = self.stats_df['background_level_db'][self.stats_df['background_level_db'] != -np.inf]
+            valid_hours = self.stats_df['file_hour'][self.stats_df['background_level_db'] != -np.inf]
+
+            if len(valid_bg_db) > 0:
+                ax2.plot(valid_hours, valid_bg_db, 'g-', alpha=0.6, linewidth=2, label='Background (dB)')
+
+        ax.set_xlabel('File Number (Time Sequence)')
+        ax.set_ylabel('Number of Groups', color='blue')
+        ax2.set_ylabel('Background Level (dB)', color='green')
+        ax.set_title('Detection Timeline and Background Noise')
+        ax.legend(loc='upper left')
+        ax2.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+
+    def _plot_signal_quality(self, ax):
+        """Plot signal quality distributions - ENHANCED VERSION"""
+        if self.stats_df.empty:
+            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('Signal Quality')
+            return
+
+        # Create box plot for signal quality metrics
+        data_to_plot = []
+        labels = []
+
+        if 'snr_mean' in self.stats_df.columns:
+            snr_data = self.stats_df['snr_mean'].dropna()
+            if not snr_data.empty:
+                data_to_plot.append(snr_data)
+                labels.append('SNR (dB)')
+
+        if 'validated_clicks' in self.stats_df.columns:
+            clicks_data = self.stats_df['validated_clicks'].dropna()
+            if not clicks_data.empty:
+                data_to_plot.append(clicks_data)
+                labels.append('Valid Clicks')
+
+        if data_to_plot:
+            box_plot = ax.boxplot(data_to_plot, labels=labels, patch_artist=True)
+            colors = ['lightblue', 'lightgreen']
+            for i, patch in enumerate(box_plot['boxes']):
+                if i < len(colors):
+                    patch.set_facecolor(colors[i])
+        else:
+            ax.text(0.5, 0.5, 'No signal quality data', ha='center', va='center', transform=ax.transAxes)
+
+        ax.set_title('Signal Quality Distribution')
+        ax.grid(True, alpha=0.3)
+
+    def _plot_detection_stats(self, ax):
+        """Plot detection statistics - FIXED VERSION"""
+        if self.stats_df.empty:
+            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('Detection Stats')
+            return
+
+        # Detection success rate
+        files_with_detections = len(self.detections_df['source_file'].unique()) if not self.detections_df.empty else 0
+        total_files = len(self.stats_df)
+        files_without = total_files - files_with_detections
+
+        # Pie chart
+        sizes = [files_with_detections, files_without]
+        labels = [f'With Detections\n({files_with_detections})', f'No Detections\n({files_without})']
+        colors = ['lightgreen', 'lightcoral']
+
+        if total_files > 0:
+            wedges, texts, autotexts = ax.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+        else:
+            ax.text(0.5, 0.5, 'No files processed', ha='center', va='center', transform=ax.transAxes)
+
+        ax.set_title('Detection Success Rate')
+
+    def _plot_activity_heatmap(self, ax):
+        """Plot activity heatmap - FIXED VERSION"""
+        if self.detections_df.empty:
+            ax.text(0.5, 0.5, 'No detections', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('Activity Heatmap')
+            return
+
+        # Create activity matrix (simplified for demo)
+        if 'file_hour' in self.detections_df.columns and 'num_clicks' in self.detections_df.columns:
+            hourly_activity = self.detections_df.groupby('file_hour')['num_clicks'].sum()
+
+            # Reshape into a matrix (e.g., 6x8 for 48 files)
+            n_files = len(self.stats_df)
+            rows = 6
+            cols = int(np.ceil(n_files / rows)) if n_files > 0 else 1
+
+            activity_matrix = np.zeros((rows, cols))
+            for hour, clicks in hourly_activity.items():
+                if hour < n_files:
+                    row = hour // cols
+                    col = hour % cols
+                    if row < rows and col < cols:
+                        activity_matrix[row, col] = clicks
+
+            # Create heatmap
+            im = ax.imshow(activity_matrix, cmap='YlOrRd', aspect='auto')
+            ax.set_title('Activity Heatmap (Clicks per Time Block)')
+            ax.set_xlabel('Time Block')
+            ax.set_ylabel('Period')
+
+            # Add colorbar
+            plt.colorbar(im, ax=ax, label='Total Clicks')
+        else:
+            ax.text(0.5, 0.5, 'Insufficient data for heatmap', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('Activity Heatmap')
+
+    def _create_detailed_plots(self, output_path):
+        """Create additional detailed plots - ENHANCED VERSION"""
+
+        # 1. Detailed timeline plot
+        if not self.detections_df.empty and all(
+                col in self.detections_df.columns for col in ['file_hour', 'start_time', 'num_clicks', 'mean_snr_db']):
+            plt.figure(figsize=(15, 8))
+
+            # Plot individual detection events
+            for _, detection in self.detections_df.iterrows():
+                plt.scatter(detection['file_hour'], detection['start_time'],
+                            s=detection['num_clicks'] * 10, alpha=0.6,
+                            c=detection['mean_snr_db'], cmap='viridis')
+
+            plt.colorbar(label='Mean SNR (dB)')
+            plt.xlabel('File Number')
+            plt.ylabel('Detection Time within File (s)')
+            plt.title('Individual Detection Events (size = click count)')
+            plt.grid(True, alpha=0.3)
+
+            detail_path = output_path / "detection_events.png"
+            plt.savefig(detail_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            print(f"Detailed plot saved to: {detail_path}")
+
+    def export_summary(self, output_dir):
+        """Export summary statistics to file - ENHANCED VERSION"""
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        summary_text = self.generate_daily_summary()
+
+        # Save summary text
+        summary_file = output_path / "enhanced_daily_summary.txt"
+        with open(summary_file, 'w') as f:
+            f.write(summary_text)
+
+        # Save detailed CSV with dB values
+        if not self.stats_df.empty:
+            detailed_file = output_path / "enhanced_daily_stats.csv"
+            self.stats_df.to_csv(detailed_file, index=False)
+
+        if not self.detections_df.empty:
+            detections_file = output_path / "enhanced_daily_detections.csv"
+            self.detections_df.to_csv(detections_file, index=False)
+
+        print(f"Enhanced summary exported to: {summary_file}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='江豚Click檢測比較結果視覺化工具')
-    parser.add_argument('detection_path', type=Path, help='檢測結果CSV檔案或包含比較檔案的目錄')
-
-    # 分析模式選擇
-    mode_group = parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument('--comparison', action='store_true', help='繪製閾值比較圖')
-    mode_group.add_argument('--file', type=str, help='分析特定檔案的閾值比較')
-    mode_group.add_argument('--export', action='store_true', help='匯出比較摘要')
-
-    # 額外參數
-    parser.add_argument('--audio-dir', type=Path, help='音檔目錄路徑（用於讀取原始音檔）')
-    parser.add_argument('--output', '-o', type=Path, help='輸出圖片或檔案路徑')
+    parser = argparse.ArgumentParser(description='Enhanced Daily Porpoise Detection Analysis')
+    parser.add_argument('results_dir', help='Directory containing detection results')
+    parser.add_argument('--output-dir', '-o', default='./enhanced_daily_analysis',
+                        help='Output directory for analysis results')
 
     args = parser.parse_args()
 
-    if not args.detection_path.exists():
-        print(f"檢測結果路徑不存在: {args.detection_path}")
-        sys.exit(1)
+    # Initialize analyzer
+    analyzer = DailyAnalyzer()
 
-    # 創建視覺化工具
-    visualizer = ComparisonVisualizer(args.detection_path)
+    try:
+        # Load data
+        print("Loading detection data...")
+        analyzer.load_data(args.results_dir)
 
-    # 執行對應功能
-    if args.comparison:
-        visualizer.plot_threshold_comparison(args.output)
+        # Generate summary
+        print("\nGenerating enhanced summary...")
+        summary = analyzer.generate_daily_summary()
+        print(summary)
 
-    elif args.file:
-        if args.file not in visualizer.files:
-            print(f"檔案 {args.file} 不在檢測結果中")
-            print(f"可用檔案: {', '.join(visualizer.files[:10])}{'...' if len(visualizer.files) > 10 else ''}")
-            sys.exit(1)
-        visualizer.plot_file_detail(args.file, args.audio_dir, args.output)
+        # Create visualizations
+        print("\nCreating enhanced visualizations...")
+        analyzer.create_visualizations(args.output_dir)
 
-    elif args.export:
-        if not args.output:
-            if args.detection_path.is_file():
-                output_path = args.detection_path.parent / f"{args.detection_path.stem}_summary.csv"
-            else:
-                output_path = args.detection_path / "comparison_summary.csv"
-        else:
-            output_path = args.output
-        visualizer.export_comparison_summary(output_path)
+        # Export summary
+        print("\nExporting enhanced summary...")
+        analyzer.export_summary(args.output_dir)
+
+        print(f"\nEnhanced analysis complete! Results saved to: {args.output_dir}")
+
+    except Exception as e:
+        print(f"Error during analysis: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == '__main__':
